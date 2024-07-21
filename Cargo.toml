@@ -44,6 +44,7 @@ embassy-executor = { version = "0.5.0", features = ["nightly", "integrated-timer
 embassy-sync = "0.6.0"
 embedded-hal = { version = "1.0.0" }
 embassy-net = { version = "0.4.0", features = ["medium-ip", "tcp", "medium-ethernet", "dhcpv4", "log", "udp"] }
+esp-hal-embassy = { version = "0.2", features = ["esp32s3"] }
 
 embedded-hal-async = "1.0.0-rc.1"
 embassy-net-driver = "0.2.0"
@@ -54,6 +55,7 @@ embedded-graphics = "0.8.1"
 mipidsi = { git = "https://github.com/almindor/mipidsi.git", rev= "7ff5271" }
 display-interface-parallel-gpio = "0.7.0"
 tinygif = "0.0.4"
+static_cell = { version="2.1.0", features = ["nightly"] }
 
 [profile.dev]
 # Rust debug is too slow.

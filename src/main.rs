@@ -1,17 +1,23 @@
 #![no_std]
 #![no_main]
+#![feature(type_alias_impl_trait)]
+
+mod wifi;
 
 use display_interface_parallel_gpio::{Generic8BitBus, PGPIO8BitInterface};
+use embassy_executor::Spawner;
+use embassy_net::{Config, Stack, StackResources};
+use embassy_time::{Duration, Timer};
 use embedded_graphics::framebuffer::Framebuffer;
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::raw::BigEndian;
 use embedded_graphics::pixelcolor::{BinaryColor, Rgb565};
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Alignment, Text};
 use embedded_graphics::{draw_target::DrawTarget, prelude::RgbColor};
 use esp_backtrace as _;
+use esp_hal::timer::{ErasedTimer, OneShotTimer, PeriodicTimer};
 use esp_hal::{
     clock::ClockControl,
     delay::Delay,
@@ -23,11 +29,16 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println::println;
+use esp_wifi::initialize;
+use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 use mipidsi::options::{ColorInversion, ColorOrder, Orientation, Rotation};
 use mipidsi::{models::ST7789, Builder};
 
 extern crate alloc;
+
 use core::mem::MaybeUninit;
+
+use crate::wifi::wifi_task;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -41,19 +52,22 @@ fn init_heap() {
     }
 }
 
-#[entry]
-fn main() -> ! {
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
+
+#[main]
+async fn main(spawner: Spawner) -> ! {
     init_heap();
 
     let peripherals = Peripherals::take();
     let system = SystemControl::new(peripherals.SYSTEM);
     let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
-
-    // let timer = esp_hal::timer::PeriodicTimer::new(
-    //     esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0, &clocks, None)
-    //         .timer0
-    //         .into(),
-    // v);
 
     // Disable the RTC and TIMG watchdog timers
     let mut rtc = Rtc::new(peripherals.LPWR, None);
@@ -67,15 +81,7 @@ fn main() -> ! {
 
     esp_println::logger::init_logger_from_env();
 
-    //     esp_wifi::EspWifiInitFor::Wifi,
-    //     timer_group0,
-    //     esp_hal::rng::Rng::new(peripherals.RNG),
-    //     peripherals.RADIO_CLK,
-    //     &clocks,
-    // )
-    // .unwrap();
-
-    println!("Hello board!");
+    let timer = PeriodicTimer::new(timer_group1.timer0.into());
 
     // Set GPIO4 as an output, and set its state high initially.
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
@@ -120,13 +126,62 @@ fn main() -> ! {
     display.clear(Rgb565::RED).unwrap();
     println!("display init ok");
 
+    println!("init embassy");
+
+    let timer0 = OneShotTimer::new(timer_group0.timer0.into());
+    let timers = [timer0];
+    let timers = mk_static!([OneShotTimer<ErasedTimer>; 1], timers);
+
+    esp_hal_embassy::init(&clocks, timers);
+
+    println!("init wifi");
+
+    let init = initialize(
+        esp_wifi::EspWifiInitFor::Wifi,
+        timer,
+        esp_hal::rng::Rng::new(peripherals.RNG),
+        peripherals.RADIO_CLK,
+        &clocks,
+    )
+    .unwrap();
+
+    let wifi = peripherals.WIFI;
+    let (wifi_interface, controller) =
+        esp_wifi::wifi::new_with_mode(&init, wifi, WifiStaDevice).unwrap();
+    let config = Config::dhcpv4(Default::default());
+
+    let seed = 1234;
+
+    println!("init network stack");
+
+    let stack = &*mk_static!(
+        Stack<WifiDevice<'_, WifiStaDevice>>,
+        Stack::new(
+            wifi_interface,
+            config,
+            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            seed
+        )
+    );
+
+    spawner.spawn(wifi::connection(controller)).ok();
+    spawner.spawn(wifi_task(stack)).ok();
+
+    loop {
+        if stack.is_link_up() {
+            break;
+        }
+        println!("Waiting for IP...");
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
     let mut fb = Framebuffer::<
         Rgb565,
         _,
         BigEndian,
         320,
         170,
-        { embedded_graphics::framebuffer::buffer_size::<Rgb565>(320,170) },
+        { embedded_graphics::framebuffer::buffer_size::<Rgb565>(320, 170) },
     >::new();
     fb.clear(Rgb565::WHITE).unwrap();
 
@@ -148,7 +203,7 @@ fn main() -> ! {
 
     loop {
         for frame in gif.frames() {
-            frame.draw(&mut fb.translated(Point::new(0, 30))).unwrap();
+            frame.draw(&mut fb.translated(Point::new(0, 10))).unwrap();
 
             fb.as_image().draw(&mut display).unwrap();
         }
