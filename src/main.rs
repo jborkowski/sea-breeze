@@ -238,6 +238,7 @@ pub struct Data {
     wave_period: Option<i32>,
     wave_height: Option<f64>,
     spot_name: String,
+    air_temperature: i32,
 }
 
 #[embassy_executor::task]
@@ -314,6 +315,9 @@ async fn render_task(shared_data: SharedData, mut display: DISPLAY) {
             let mut wind_speed = heapless::String::<40>::new();
             write!(wind_speed, "Wind Speed: {}kts", data.wind_speed).unwrap();
 
+            let mut air_temperature = heapless::String::<30>::new();
+            write!(air_temperature, "Air Temperature: {}°C", data.air_temperature).unwrap();
+
             let mut wave_height = heapless::String::<20>::new();
             write!(
                 wave_height,
@@ -330,15 +334,34 @@ async fn render_task(shared_data: SharedData, mut display: DISPLAY) {
                 .draw(&mut display)
                 .unwrap();
 
-            Text::with_alignment(&data.datetime, Point::new(20, 100), style_0, Alignment::Center)
-                .draw(&mut display)
-                .unwrap();
+            Text::with_alignment(
+                &air_temperature,
+                Point::new(20, 80),
+                style_0,
+                Alignment::Left,
+            )
+            .draw(&mut display)
+            .unwrap();
+
+            Text::with_alignment(
+                &data.datetime,
+                Point::new(40, 120),
+                style_0,
+                Alignment::Left,
+            )
+            .draw(&mut display)
+            .unwrap();
 
             break;
         }
 
-        Text::with_alignment("NO DATA", Point::new(320/2, 170/2), style_0, Alignment::Center)
-            .draw(&mut display)
-            .unwrap();
+        Text::with_alignment(
+            "NO DATA",
+            Point::new(320 / 2, 170 / 2),
+            style_0,
+            Alignment::Center,
+        )
+        .draw(&mut display)
+        .unwrap();
     }
 }
