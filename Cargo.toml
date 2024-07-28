@@ -12,7 +12,17 @@ esp-backtrace = { version = "0.13.0", features = [
     "panic-handler",
     "println",
 ] }
-esp-hal = { version = "0.19.0", fuatures  = [ "esp32s3", "async", "integrated-timers" ] }
+esp-hal = { version = "0.19.0", fuatures  = [
+  "esp32s3",
+  "async",
+  "integrated-timers",
+  "esp-wifi",
+  "esp-wifi/wifi-default",
+  "esp-wifi/wifi",
+  "esp-wifi/utils",
+  "esp-wifi/async",
+  "esp-wifi/embassy-net"
+] }
 esp-println = { version = "0.10.0", features = ["esp32s3", "log"] }
 log = { version = "0.4.21" }
 esp-alloc = { version = "0.4.0" }
@@ -43,19 +53,21 @@ embassy-time-driver = { version = "0.1.0", features = [ "tick-hz-1_000_000" ] }
 embassy-executor = { version = "0.5.0", features = ["nightly", "integrated-timers","executor-thread"] }
 embassy-sync = "0.6.0"
 embedded-hal = { version = "1.0.0" }
-embassy-net = { version = "0.4.0", features = ["medium-ip", "tcp", "medium-ethernet", "dhcpv4", "log", "udp"] }
+embassy-net = { version = "0.4.0", features = ["medium-ip", "tcp", "medium-ethernet", "dhcpv4", "log", "udp", "dns"] }
 esp-hal-embassy = { version = "0.2", features = ["esp32s3"] }
 
 embedded-hal-async = "1.0.0-rc.1"
 embassy-net-driver = "0.2.0"
 embedded-io-async = { version = "0.6.0" }
 
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.120", features = ["alloc"], default-features = false }
 embedded-graphics = "0.8.1"
 mipidsi = { git = "https://github.com/almindor/mipidsi.git", rev= "7ff5271" }
 display-interface-parallel-gpio = "0.7.0"
 tinygif = "0.0.4"
 static_cell = { version="2.1.0", features = ["nightly"] }
+reqwless = { version = "0.12.1", features = ["alloc"] }
 
 [profile.dev]
 # Rust debug is too slow.

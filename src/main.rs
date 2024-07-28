@@ -4,15 +4,18 @@
 
 mod wifi;
 
+use alloc::sync::Arc;
+use core::fmt::Write;
 use display_interface_parallel_gpio::{Generic8BitBus, PGPIO8BitInterface};
 use embassy_executor::Spawner;
-use embassy_net::{Config, Stack, StackResources};
-use embassy_time::{Duration, Timer};
-use embedded_graphics::framebuffer::Framebuffer;
-use embedded_graphics::mono_font::ascii::FONT_10X20;
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::{dns::DnsSocket, Config, Stack, StackResources};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Ticker, Timer};
+use embedded_graphics::mono_font::iso_8859_7::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
-use embedded_graphics::pixelcolor::raw::BigEndian;
-use embedded_graphics::pixelcolor::{BinaryColor, Rgb565};
+use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Alignment, Text};
 use embedded_graphics::{draw_target::DrawTarget, prelude::RgbColor};
@@ -32,16 +35,39 @@ use esp_println::println;
 use esp_wifi::initialize;
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 use mipidsi::options::{ColorInversion, ColorOrder, Orientation, Rotation};
+use mipidsi::Display;
 use mipidsi::{models::ST7789, Builder};
+use reqwless::client::HttpClient;
+use reqwless::request::Method;
 
 extern crate alloc;
 
+use core::borrow::BorrowMut;
 use core::mem::MaybeUninit;
 
 use crate::wifi::wifi_task;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
+
+type SharedData = Arc<Mutex<NoopRawMutex, Option<Data>>>;
+
+type DI = PGPIO8BitInterface<
+    Generic8BitBus<
+        Output<'static, esp_hal::gpio::GpioPin<39>>,
+        Output<'static, esp_hal::gpio::GpioPin<40>>,
+        Output<'static, esp_hal::gpio::GpioPin<41>>,
+        Output<'static, esp_hal::gpio::GpioPin<42>>,
+        Output<'static, esp_hal::gpio::GpioPin<45>>,
+        Output<'static, esp_hal::gpio::GpioPin<46>>,
+        Output<'static, esp_hal::gpio::GpioPin<47>>,
+        Output<'static, esp_hal::gpio::GpioPin<48>>,
+    >,
+    Output<'static, esp_hal::gpio::GpioPin<7>>,
+    Output<'static, esp_hal::gpio::GpioPin<8>>,
+>;
+
+type DISPLAY = Display<DI, ST7789, Output<'static, esp_hal::gpio::GpioPin<5>>>;
 
 fn init_heap() {
     const HEAP_SIZE: usize = 32 * 1024;
@@ -62,7 +88,7 @@ macro_rules! mk_static {
 }
 
 #[main]
-async fn main(spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) {
     init_heap();
 
     let peripherals = Peripherals::take();
@@ -115,16 +141,21 @@ async fn main(spawner: Spawner) -> ! {
 
     let display_interface = PGPIO8BitInterface::new(bus, dc, wr);
 
-    let mut display = Builder::new(ST7789, display_interface)
+    let mut display: DISPLAY = Builder::new(ST7789, display_interface)
         .reset_pin(rst)
         .display_size(170, 320)
+        .display_offset(35, 0)
         .color_order(ColorOrder::Rgb)
         .invert_colors(ColorInversion::Inverted)
         .orientation(Orientation::new().rotate(Rotation::Deg90))
         .init(&mut delay)
         .unwrap();
+
     display.clear(Rgb565::RED).unwrap();
     println!("display init ok");
+
+    display.clear(Rgb565::BLUE).unwrap();
+    let data: SharedData = Arc::new(Mutex::new(None));
 
     println!("init embassy");
 
@@ -166,46 +197,148 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(wifi::connection(controller)).ok();
     spawner.spawn(wifi_task(stack)).ok();
+    spawner.spawn(load_data(stack, data.clone())).ok();
+    spawner.spawn(render_task(data.clone(), display)).ok();
+
+    // let mut fb = Framebuffer::<
+    //     Rgb565,
+    //     _,
+    //     BigEndian,
+    //     320,
+    //     170,
+    //     { embedded_graphics::framebuffer::buffer_size::<Rgb565>(320, 170) },
+    // >::new();
+    // fb.clear(Rgb565::WHITE).unwrap();
+
+    // let gif = tinygif::Gif::from_slice(include_bytes!("../ferris.gif")).unwrap();
+
+    // delay.delay_ms(1000u32);
+
+    //     loop {
+    //         for frame in gif.frames() {
+    //             frame.draw(&mut fb.translated(Point::new(0, 10))).unwrap();
+
+    //             fb.as_image().draw(&mut display).unwrap();
+    //         }
+    //     }
+}
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Data {
+    datetime: String,
+    wind_direction: String,
+    wind_status: String,
+    wind_speed: f64,
+    wave_direction: Option<String>,
+    wave_period: Option<i32>,
+    wave_height: Option<f64>,
+    spot_name: String,
+}
+
+#[embassy_executor::task]
+async fn load_data(
+    stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
+    shared_data: SharedData,
+) {
+    let mut rx_buffer = [0; 2048];
+    let client_state = TcpClientState::<1, 2048, 2048>::new();
+    let tcp_client = TcpClient::new(stack, &client_state);
+    let dns = DnsSocket::new(stack);
+
+    let mut ticker = Ticker::every(Duration::from_secs(10));
 
     loop {
-        if stack.is_link_up() {
+        ticker.next().await;
+
+        println!("Fetching weather data");
+
+        stack.wait_config_up().await;
+
+        loop {
+            if let Some(config) = stack.config_v4() {
+                println!("Got IP: {}", config.address);
+                break;
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }
+
+        let mut http_client = HttpClient::new(&tcp_client, &dns);
+        let mut request = http_client
+            .request(Method::GET, "http://192.168.1.10:3000")
+            .await
+            .unwrap();
+
+        let response = request.send(&mut rx_buffer).await.unwrap();
+
+        if let Ok(body) = response.body().read_to_end().await {
+            let data: Data = serde_json::from_slice(body).unwrap();
+            println!("Just Received: {:?}", data);
+
+            let mut shared_data_lock = shared_data.lock().await;
+            let shared_data_ref = shared_data_lock.borrow_mut();
+
+            **shared_data_ref = Some(data);
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn render_task(shared_data: SharedData, mut display: DISPLAY) {
+    let mut ticker = Ticker::every(Duration::from_millis(10));
+
+    let style_0 = MonoTextStyleBuilder::new()
+        // .background_color(Rgb565::BLACK)
+        .text_color(Rgb565::CSS_BISQUE)
+        .font(&FONT_10X20)
+        .build();
+
+    loop {
+        ticker.next().await;
+
+        if let Some(data) = shared_data.lock().await.clone() {
+            display.clear(Rgb565::BLUE).unwrap();
+            println!("Data do display: {:?}", data);
+
+            let mut spot_name = heapless::String::<40>::new();
+            write!(spot_name, "Spot Name: {}", data.spot_name).unwrap();
+
+            Text::with_alignment(&spot_name, Point::new(20, 20), style_0, Alignment::Left)
+                .draw(&mut display)
+                .unwrap();
+
+            let mut wind_speed = heapless::String::<40>::new();
+            write!(wind_speed, "Wind Speed: {}kts", data.wind_speed).unwrap();
+
+            let mut wave_height = heapless::String::<20>::new();
+            write!(
+                wave_height,
+                "Wave Height: {}m",
+                data.wave_height.unwrap_or(0.0)
+            )
+            .unwrap();
+
+            Text::with_alignment(&wind_speed, Point::new(20, 40), style_0, Alignment::Left)
+                .draw(&mut display)
+                .unwrap();
+
+            Text::with_alignment(&wave_height, Point::new(20, 60), style_0, Alignment::Left)
+                .draw(&mut display)
+                .unwrap();
+
+            Text::with_alignment(&data.datetime, Point::new(20, 100), style_0, Alignment::Center)
+                .draw(&mut display)
+                .unwrap();
+
             break;
         }
-        println!("Waiting for IP...");
-        Timer::after(Duration::from_millis(500)).await;
-    }
 
-    let mut fb = Framebuffer::<
-        Rgb565,
-        _,
-        BigEndian,
-        320,
-        170,
-        { embedded_graphics::framebuffer::buffer_size::<Rgb565>(320, 170) },
-    >::new();
-    fb.clear(Rgb565::WHITE).unwrap();
-
-    let gif = tinygif::Gif::from_slice(include_bytes!("../ferris.gif")).unwrap();
-
-    //     Text::with_alignment(
-    //         &"Test Text",
-    //         Point::new(100, 40),
-    //         MonoTextStyleBuilder::new()
-    //             .background_color(Rgb565::BLACK)
-    //             .text_color(Rgb565::CSS_BISQUE)
-    //             .font(&FONT_10X20)
-    //             .build(),
-    //         Alignment::Center,
-    //     )
-    //     .draw(&mut display)
-    //     .unwrap();
-    //     delay.delay_ms(1000u32);
-
-    loop {
-        for frame in gif.frames() {
-            frame.draw(&mut fb.translated(Point::new(0, 10))).unwrap();
-
-            fb.as_image().draw(&mut display).unwrap();
-        }
+        Text::with_alignment("NO DATA", Point::new(320/2, 170/2), style_0, Alignment::Center)
+            .draw(&mut display)
+            .unwrap();
     }
 }
